@@ -47,7 +47,7 @@ def signal_1_excluded_provider(con: duckdb.DuckDBPyConnection) -> list[dict]:
                 MAX(m.CLAIM_FROM_MONTH) AS last_claim_month
             FROM spending m
             JOIN leie_with_npi l ON m.BILLING_PROVIDER_NPI_NUM = l.NPI
-            WHERE m.CLAIM_FROM_MONTH > l.excl_ym
+            WHERE m.CLAIM_FROM_MONTH >= l.excl_ym
               AND (l.rein_ym IS NULL OR m.CLAIM_FROM_MONTH < l.rein_ym)
             GROUP BY 1, 2, 3
         ),
@@ -63,7 +63,7 @@ def signal_1_excluded_provider(con: duckdb.DuckDBPyConnection) -> list[dict]:
                 MAX(m.CLAIM_FROM_MONTH) AS last_claim_month
             FROM spending m
             JOIN leie_with_npi l ON m.SERVICING_PROVIDER_NPI_NUM = l.NPI
-            WHERE m.CLAIM_FROM_MONTH > l.excl_ym
+            WHERE m.CLAIM_FROM_MONTH >= l.excl_ym
               AND (l.rein_ym IS NULL OR m.CLAIM_FROM_MONTH < l.rein_ym)
             GROUP BY 1, 2, 3
         )
@@ -116,7 +116,7 @@ def signal_1_excluded_provider(con: duckdb.DuckDBPyConnection) -> list[dict]:
                         AND UPPER(TRIM(n.first_name)) = l.FIRSTNAME
                         AND UPPER(TRIM(n.state)) = l.STATE
             JOIN spending m ON m.BILLING_PROVIDER_NPI_NUM = n.npi
-            WHERE m.CLAIM_FROM_MONTH > l.excl_ym
+            WHERE m.CLAIM_FROM_MONTH >= l.excl_ym
               AND (l.rein_ym IS NULL OR m.CLAIM_FROM_MONTH < l.rein_ym)
             GROUP BY 1, 2, 3
         )
@@ -659,14 +659,22 @@ def signal_6_geographic_implausibility(con: duckdb.DuckDBPyConnection) -> list[d
 
 def run_all_signals(con: duckdb.DuckDBPyConnection) -> dict[str, list[dict]]:
     """Run all 6 fraud signals and return results keyed by signal name."""
-    return {
-        "excluded_provider": signal_1_excluded_provider(con),
-        "billing_outlier": signal_2_billing_volume_outlier(con),
-        "rapid_escalation": signal_3_rapid_escalation(con),
-        "workforce_impossibility": signal_4_workforce_impossibility(con),
-        "shared_official": signal_5_shared_authorized_official(con),
-        "geographic_implausibility": signal_6_geographic_implausibility(con),
+    signal_functions = {
+        "excluded_provider": signal_1_excluded_provider,
+        "billing_outlier": signal_2_billing_volume_outlier,
+        "rapid_escalation": signal_3_rapid_escalation,
+        "workforce_impossibility": signal_4_workforce_impossibility,
+        "shared_official": signal_5_shared_authorized_official,
+        "geographic_implausibility": signal_6_geographic_implausibility,
     }
+    results = {}
+    for name, func in signal_functions.items():
+        try:
+            results[name] = func(con)
+        except Exception as e:
+            print(f"  ERROR in {name}: {e}")
+            results[name] = []
+    return results
 
 
 def main() -> None:

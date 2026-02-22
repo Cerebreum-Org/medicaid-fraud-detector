@@ -66,32 +66,42 @@ Flags home health providers (HCPCS G0151-G0162, G0299-G0300, S9122-S9124, T1019-
 
 ```json
 {
-  "metadata": {
-    "generated_at": "2026-02-21T...",
-    "total_providers_flagged": 1234,
-    "total_flags": 5678,
-    "total_estimated_overpayment_usd": 123456789.00,
-    "severity_distribution": { "critical": 10, "high": 200, "medium": 1024 },
-    "signal_counts": { ... }
+  "generated_at": "2026-02-21T12:00:00Z",
+  "tool_version": "medicaid-fraud-detector v1.0",
+  "total_providers_scanned": 617503,
+  "total_providers_flagged": 113473,
+  "signal_counts": {
+    "excluded_provider": 123,
+    "billing_outlier": 45678,
+    "rapid_escalation": 2345,
+    "workforce_impossibility": 34567,
+    "shared_official": 456,
+    "geographic_implausibility": 789
   },
-  "providers": [
+  "flagged_providers": [
     {
       "npi": "1234567890",
-      "provider_info": { ... },
-      "aggregate_stats": { ... },
-      "overall_severity": "critical",
-      "total_estimated_overpayment_usd": 500000.00,
-      "signal_count": 2,
-      "flags": [
+      "provider_name": "ACME HEALTH LLC",
+      "entity_type": "organization",
+      "taxonomy_code": "207Q00000X",
+      "state": "FL",
+      "enumeration_date": "2020-01-15",
+      "total_paid_all_time": 1500000.00,
+      "total_claims_all_time": 25000,
+      "total_unique_beneficiaries_all_time": 3000,
+      "signals": [
         {
-          "signal": "excluded_provider_billing",
+          "signal_type": "excluded_provider",
           "severity": "critical",
-          "evidence": { ... },
-          "estimated_overpayment_usd": 500000.00,
-          "statute_references": [ ... ],
-          "suggested_next_steps": [ ... ]
+          "evidence": { "..." : "..." }
         }
-      ]
+      ],
+      "estimated_overpayment_usd": 500000.00,
+      "fca_relevance": {
+        "claim_type": "Presenting false claims...",
+        "statute_reference": "31 U.S.C. \u00a7 3729(a)(1)(A)",
+        "suggested_next_steps": ["..."]
+      }
     }
   ]
 }
