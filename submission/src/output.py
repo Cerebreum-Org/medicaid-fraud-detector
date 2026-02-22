@@ -129,12 +129,14 @@ def estimate_overpayment(signal_name: str, flag: dict) -> float:
         return float(flag.get("total_paid_12mo", 0)) * 0.5
 
     if signal_name == "workforce_impossibility":
-        # max(0, (peak_claims - 6*8*22) * (peak_total_paid / peak_claims))
-        # 6*8*22 = 1056 = max plausible claims for a single provider in a month
-        claims = float(flag.get("max_monthly_claims", 0))
-        peak_paid = float(flag.get("peak_month_total_paid", 0) or flag.get("total_paid_peak_month", 0))
-        if claims > 0 and peak_paid > 0:
-            return max(0.0, (claims - 1056) * (peak_paid / claims))
+        # Sum across all impossible months: for each month, excess = (claims - 1056) * avg_cost
+        # Simplified: total_paid_impossible * (1 - 1056 * impossible_months / total_claims_impossible)
+        total_paid = float(flag.get("total_paid_impossible", 0))
+        total_claims = float(flag.get("total_claims_impossible", 0))
+        months = int(flag.get("impossible_months_count", 0))
+        plausible_claims = 1056.0 * months  # max plausible = 6 claims/hr * 8hr * 22 days * months
+        if total_claims > 0 and total_paid > 0:
+            return max(0.0, total_paid * (1 - plausible_claims / total_claims))
         return 0.0
 
     if signal_name == "shared_official":
@@ -271,30 +273,28 @@ def build_report(con: duckdb.DuckDBPyConnection, signal_results: dict) -> dict:
 
     for signal_name, flags in signal_results.items():
         for flag in flags:
-            # Extract NPI -- different signals store it differently
-            npi = flag.get("npi")
-            if npi is None:
-                # Signal 5 has npi_list instead of single npi
-                npi_list = flag.get("npi_list", [])
-                if npi_list:
-                    # Create a flag entry for the first NPI, reference all
-                    npi = str(npi_list[0])
-                else:
-                    continue
-
-            npi = str(npi)
-            if npi not in provider_flags:
-                provider_flags[npi] = []
+            # Extract NPIs -- Signal 5 has npi_list, others have single npi
+            npis_to_flag = []
+            if "npi_list" in flag and flag["npi_list"]:
+                npis_to_flag = [str(n) for n in flag["npi_list"]]
+            elif flag.get("npi") is not None:
+                npis_to_flag = [str(flag["npi"])]
+            else:
+                continue
 
             severity = compute_severity(signal_name, flag)
             overpayment = estimate_overpayment(signal_name, flag)
 
-            provider_flags[npi].append({
-                "signal_type": signal_name,
-                "severity": severity,
-                "evidence": flag,
-                "overpayment": overpayment,
-            })
+            for npi in npis_to_flag:
+                if npi not in provider_flags:
+                    provider_flags[npi] = []
+
+                provider_flags[npi].append({
+                    "signal_type": signal_name,
+                    "severity": severity,
+                    "evidence": flag,
+                    "overpayment": overpayment,
+                })
 
     # Build final provider records
     all_npis = set(provider_flags.keys())

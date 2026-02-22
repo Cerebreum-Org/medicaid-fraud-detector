@@ -265,7 +265,7 @@ def signal_3_rapid_escalation(con: duckdb.DuckDBPyConnection) -> list[dict]:
             SELECT
                 npi,
                 MAX(CASE
-                    WHEN prev_rolling_3mo_avg > 0
+                    WHEN month_rank >= 6 AND prev_rolling_3mo_avg > 0
                     THEN (rolling_3mo_avg - prev_rolling_3mo_avg) / prev_rolling_3mo_avg * 100
                     ELSE 0
                 END) AS max_growth_pct,
@@ -273,12 +273,16 @@ def signal_3_rapid_escalation(con: duckdb.DuckDBPyConnection) -> list[dict]:
                 MIN(month) AS first_month,
                 MAX(month) AS last_month,
                 ANY_VALUE(enum_date_raw) AS enum_date,
-                SUM(monthly_paid) AS total_paid_12mo
+                SUM(monthly_paid) AS total_paid_12mo,
+                SUM(CASE
+                    WHEN month_rank >= 6 AND prev_rolling_3mo_avg > 0
+                         AND (rolling_3mo_avg - prev_rolling_3mo_avg) / prev_rolling_3mo_avg * 100 > 200
+                    THEN monthly_paid ELSE 0
+                END) AS total_paid_excess_growth_months
             FROM with_growth
-            WHERE month_rank >= 4
             GROUP BY 1
             HAVING MAX(CASE
-                WHEN prev_rolling_3mo_avg > 0
+                WHEN month_rank >= 6 AND prev_rolling_3mo_avg > 0
                 THEN (rolling_3mo_avg - prev_rolling_3mo_avg) / prev_rolling_3mo_avg * 100
                 ELSE 0
             END) > 200
@@ -290,6 +294,7 @@ def signal_3_rapid_escalation(con: duckdb.DuckDBPyConnection) -> list[dict]:
     columns = [
         "npi", "max_growth_pct", "peak_monthly_paid",
         "first_month", "last_month", "enum_date", "total_paid_12mo",
+        "total_paid_excess_growth_months",
     ]
 
     results = []
@@ -301,6 +306,7 @@ def signal_3_rapid_escalation(con: duckdb.DuckDBPyConnection) -> list[dict]:
         d["max_growth_pct"] = float(d["max_growth_pct"] or 0)
         d["peak_monthly_paid"] = float(d["peak_monthly_paid"] or 0)
         d["total_paid_12mo"] = float(d["total_paid_12mo"] or 0)
+        d["total_paid_excess_growth_months"] = float(d["total_paid_excess_growth_months"] or 0)
         # first_billing_month is the same as first_month from the flagged CTE
         d["first_billing_month"] = d["first_month"]
         results.append(d)
@@ -368,38 +374,53 @@ def signal_4_workforce_impossibility(con: duckdb.DuckDBPyConnection) -> list[dic
             WHERE n.entity_type = '2'
             GROUP BY 1, 2
         ),
-        ranked AS (
+        with_rate AS (
             SELECT
                 npi,
                 month,
                 monthly_claims,
                 monthly_paid,
-                ROW_NUMBER() OVER (PARTITION BY npi ORDER BY monthly_claims DESC) AS rn
+                monthly_claims / (22.0 * 8.0) AS implied_claims_per_hour
             FROM org_monthly
         ),
-        peak AS (
+        impossible_months AS (
+            SELECT *
+            FROM with_rate
+            WHERE implied_claims_per_hour > 6
+        ),
+        aggregated AS (
             SELECT
                 npi,
-                monthly_claims AS max_monthly_claims,
-                month AS peak_month,
-                monthly_paid AS total_paid_peak_month,
-                monthly_claims / (22.0 * 8.0) AS implied_claims_per_hour
-            FROM ranked
-            WHERE rn = 1
+                MAX(monthly_claims) AS max_monthly_claims,
+                MAX(implied_claims_per_hour) AS implied_claims_per_hour,
+                COUNT(*) AS impossible_months_count,
+                SUM(monthly_claims) AS total_claims_impossible,
+                SUM(monthly_paid) AS total_paid_impossible,
+                (SELECT month FROM impossible_months i2
+                 WHERE i2.npi = impossible_months.npi
+                 ORDER BY monthly_claims DESC LIMIT 1) AS peak_month,
+                (SELECT monthly_paid FROM impossible_months i3
+                 WHERE i3.npi = impossible_months.npi
+                 ORDER BY monthly_claims DESC LIMIT 1) AS total_paid_peak_month
+            FROM impossible_months
+            GROUP BY 1
         )
         SELECT
             npi,
             max_monthly_claims,
             peak_month,
             implied_claims_per_hour,
-            total_paid_peak_month
-        FROM peak
-        WHERE implied_claims_per_hour > 6
+            total_paid_peak_month,
+            impossible_months_count,
+            total_claims_impossible,
+            total_paid_impossible
+        FROM aggregated
         ORDER BY implied_claims_per_hour DESC
     """).fetchall()
 
     columns = ["npi", "max_monthly_claims", "peak_month", "implied_claims_per_hour",
-                "total_paid_peak_month"]
+                "total_paid_peak_month", "impossible_months_count",
+                "total_claims_impossible", "total_paid_impossible"]
 
     results = []
     for row in rows:
@@ -409,6 +430,9 @@ def signal_4_workforce_impossibility(con: duckdb.DuckDBPyConnection) -> list[dic
         d["max_monthly_claims"] = int(d["max_monthly_claims"] or 0)
         d["implied_claims_per_hour"] = float(d["implied_claims_per_hour"] or 0)
         d["total_paid_peak_month"] = float(d["total_paid_peak_month"] or 0)
+        d["impossible_months_count"] = int(d["impossible_months_count"] or 0)
+        d["total_claims_impossible"] = int(d["total_claims_impossible"] or 0)
+        d["total_paid_impossible"] = float(d["total_paid_impossible"] or 0)
         results.append(d)
 
     print(f"    Signal 4: {len(results)} flags")
