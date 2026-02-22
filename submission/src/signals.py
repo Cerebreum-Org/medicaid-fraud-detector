@@ -99,7 +99,7 @@ def signal_1_excluded_provider(con: duckdb.DuckDBPyConnection) -> list[dict]:
                         THEN SUBSTR(REINDATE::VARCHAR, 1, 4) || '-' || SUBSTR(REINDATE::VARCHAR, 5, 2)
                         ELSE NULL END AS rein_ym
             FROM leie
-            WHERE NPI IS NULL
+            WHERE NPI IS NULL OR CAST(NPI AS VARCHAR) = ''
         ),
         name_matches AS (
             SELECT
@@ -112,9 +112,9 @@ def signal_1_excluded_provider(con: duckdb.DuckDBPyConnection) -> list[dict]:
                 MIN(m.CLAIM_FROM_MONTH) AS first_claim_month,
                 MAX(m.CLAIM_FROM_MONTH) AS last_claim_month
             FROM leie_no_npi l
-            JOIN nppes n ON UPPER(TRIM(n.last_name)) = l.LASTNAME
-                        AND UPPER(TRIM(n.first_name)) = l.FIRSTNAME
-                        AND UPPER(TRIM(n.state)) = l.STATE
+            JOIN nppes n ON UPPER(TRIM(n.last_name)) = UPPER(TRIM(l.LASTNAME))
+                        AND UPPER(TRIM(n.first_name)) = UPPER(TRIM(l.FIRSTNAME))
+                        AND UPPER(TRIM(n.state)) = UPPER(TRIM(l.STATE))
             JOIN spending m ON m.BILLING_PROVIDER_NPI_NUM = n.npi
             WHERE m.CLAIM_FROM_MONTH >= l.excl_ym
               AND (l.rein_ym IS NULL OR m.CLAIM_FROM_MONTH < l.rein_ym)
@@ -235,6 +235,7 @@ def signal_3_rapid_escalation(con: duckdb.DuckDBPyConnection) -> list[dict]:
             SELECT *
             FROM new_providers
             WHERE enum_ym IS NOT NULL
+              AND enum_ym <= first_billing_month
               AND first_billing_month <= enum_plus_24_ym
               AND month_rank <= 12
         ),
