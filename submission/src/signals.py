@@ -300,7 +300,49 @@ def signal_3_rapid_escalation(con: duckdb.DuckDBPyConnection) -> list[dict]:
         d["max_growth_pct"] = float(d["max_growth_pct"] or 0)
         d["peak_monthly_paid"] = float(d["peak_monthly_paid"] or 0)
         d["total_paid_12mo"] = float(d["total_paid_12mo"] or 0)
+        # first_billing_month is the same as first_month from the flagged CTE
+        d["first_billing_month"] = d["first_month"]
         results.append(d)
+
+    # Fetch monthly paid amounts for the first 12 months for all flagged NPIs
+    if results:
+        flagged_npis = [d["npi"] for d in results]
+        # Use a parameterized IN list via DuckDB list unnest
+        monthly_rows = con.execute("""
+            WITH provider_months AS (
+                SELECT
+                    BILLING_PROVIDER_NPI_NUM AS npi,
+                    CLAIM_FROM_MONTH AS month,
+                    SUM(TOTAL_PAID) AS monthly_paid
+                FROM spending
+                WHERE BILLING_PROVIDER_NPI_NUM IN (SELECT UNNEST(?::VARCHAR[]))
+                GROUP BY 1, 2
+            ),
+            ranked AS (
+                SELECT
+                    npi,
+                    month,
+                    monthly_paid,
+                    ROW_NUMBER() OVER (PARTITION BY npi ORDER BY month) AS month_rank
+                FROM provider_months
+            )
+            SELECT npi, month, monthly_paid
+            FROM ranked
+            WHERE month_rank <= 12
+            ORDER BY npi, month
+        """, [flagged_npis]).fetchall()
+
+        # Build a dict: npi -> {month: amount}
+        monthly_map: dict[str, dict[str, float]] = {}
+        for npi, month, paid in monthly_rows:
+            npi_str = str(npi)
+            if npi_str not in monthly_map:
+                monthly_map[npi_str] = {}
+            monthly_map[npi_str][str(month)] = float(paid or 0)
+
+        for d in results:
+            npi_str = str(d["npi"])
+            d["monthly_paid_amounts"] = monthly_map.get(npi_str, {})
 
     print(f"    Signal 3: {len(results)} flags")
     return results
@@ -318,31 +360,45 @@ def signal_4_workforce_impossibility(con: duckdb.DuckDBPyConnection) -> list[dic
             SELECT
                 m.BILLING_PROVIDER_NPI_NUM AS npi,
                 m.CLAIM_FROM_MONTH AS month,
-                SUM(m.TOTAL_CLAIMS) AS monthly_claims
+                SUM(m.TOTAL_CLAIMS) AS monthly_claims,
+                SUM(m.TOTAL_PAID) AS monthly_paid
             FROM spending m
             JOIN nppes n ON m.BILLING_PROVIDER_NPI_NUM = n.npi
             WHERE n.entity_type = '2'
             GROUP BY 1, 2
         ),
-        max_monthly AS (
+        ranked AS (
             SELECT
                 npi,
-                MAX(monthly_claims) AS max_monthly_claims,
-                ANY_VALUE(month) AS peak_month
+                month,
+                monthly_claims,
+                monthly_paid,
+                ROW_NUMBER() OVER (PARTITION BY npi ORDER BY monthly_claims DESC) AS rn
             FROM org_monthly
-            GROUP BY 1
+        ),
+        peak AS (
+            SELECT
+                npi,
+                monthly_claims AS max_monthly_claims,
+                month AS peak_month,
+                monthly_paid AS total_paid_peak_month,
+                monthly_claims / (22.0 * 8.0) AS implied_claims_per_hour
+            FROM ranked
+            WHERE rn = 1
         )
         SELECT
             npi,
             max_monthly_claims,
             peak_month,
-            max_monthly_claims / (22.0 * 8.0) AS implied_claims_per_hour
-        FROM max_monthly
-        WHERE max_monthly_claims / (22.0 * 8.0) > 6
+            implied_claims_per_hour,
+            total_paid_peak_month
+        FROM peak
+        WHERE implied_claims_per_hour > 6
         ORDER BY implied_claims_per_hour DESC
     """).fetchall()
 
-    columns = ["npi", "max_monthly_claims", "peak_month", "implied_claims_per_hour"]
+    columns = ["npi", "max_monthly_claims", "peak_month", "implied_claims_per_hour",
+                "total_paid_peak_month"]
 
     results = []
     for row in rows:
@@ -351,6 +407,7 @@ def signal_4_workforce_impossibility(con: duckdb.DuckDBPyConnection) -> list[dic
             d["peak_month"] = str(d["peak_month"])
         d["max_monthly_claims"] = int(d["max_monthly_claims"] or 0)
         d["implied_claims_per_hour"] = float(d["implied_claims_per_hour"] or 0)
+        d["total_paid_peak_month"] = float(d["total_paid_peak_month"] or 0)
         results.append(d)
 
     print(f"    Signal 4: {len(results)} flags")
@@ -427,6 +484,29 @@ def signal_5_shared_authorized_official(con: duckdb.DuckDBPyConnection) -> list[
             d["states"] = [str(x) for x in d["states"]]
         results.append(d)
 
+    # Fetch per-NPI total_paid breakdowns for all NPIs in flagged officials
+    if results:
+        all_npis = []
+        for d in results:
+            all_npis.extend(d["npi_list"])
+        all_npis = list(set(all_npis))
+
+        npi_paid_rows = con.execute("""
+            SELECT
+                BILLING_PROVIDER_NPI_NUM AS npi,
+                SUM(TOTAL_PAID) AS total_paid
+            FROM spending
+            WHERE BILLING_PROVIDER_NPI_NUM IN (SELECT UNNEST(?::VARCHAR[]))
+            GROUP BY 1
+        """, [all_npis]).fetchall()
+
+        npi_paid_map: dict[str, float] = {}
+        for npi, paid in npi_paid_rows:
+            npi_paid_map[str(npi)] = float(paid or 0)
+
+        for d in results:
+            d["npi_totals"] = {npi: npi_paid_map.get(npi, 0.0) for npi in d["npi_list"]}
+
     print(f"    Signal 5: {len(results)} flags")
     return results
 
@@ -474,13 +554,16 @@ def signal_6_geographic_implausibility(con: duckdb.DuckDBPyConnection) -> list[d
             GROUP BY 1
             HAVING SUM(monthly_beneficiaries) * 1.0 / NULLIF(SUM(monthly_claims), 0) < 0.1
         )
-        SELECT * FROM flagged
-        ORDER BY bene_to_claims_ratio ASC
+        SELECT f.*, n.state
+        FROM flagged f
+        LEFT JOIN nppes n ON f.npi = n.npi
+        ORDER BY f.bene_to_claims_ratio ASC
     """).fetchall()
 
     columns = [
         "npi", "total_claims", "total_beneficiaries", "total_paid",
         "bene_to_claims_ratio", "months_flagged", "first_month", "last_month",
+        "state",
     ]
 
     results = []
@@ -494,7 +577,81 @@ def signal_6_geographic_implausibility(con: duckdb.DuckDBPyConnection) -> list[d
         d["total_paid"] = float(d["total_paid"] or 0)
         d["bene_to_claims_ratio"] = float(d["bene_to_claims_ratio"] or 0)
         d["months_flagged"] = int(d["months_flagged"] or 0)
+        d["state"] = str(d["state"]) if d["state"] else None
         results.append(d)
+
+    # Fetch flagged HCPCS codes and month-level detail for flagged NPIs
+    if results:
+        flagged_npis = [d["npi"] for d in results]
+
+        # Get distinct HCPCS codes that triggered the flag per NPI
+        hcpcs_rows = con.execute("""
+            SELECT
+                BILLING_PROVIDER_NPI_NUM AS npi,
+                LIST(DISTINCT HCPCS_CODE ORDER BY HCPCS_CODE) AS hcpcs_codes
+            FROM spending
+            WHERE BILLING_PROVIDER_NPI_NUM IN (SELECT UNNEST(?::VARCHAR[]))
+              AND (
+                HCPCS_CODE BETWEEN 'G0151' AND 'G0162'
+                OR HCPCS_CODE BETWEEN 'G0299' AND 'G0300'
+                OR HCPCS_CODE BETWEEN 'S9122' AND 'S9124'
+                OR HCPCS_CODE BETWEEN 'T1019' AND 'T1022'
+              )
+            GROUP BY 1
+        """, [flagged_npis]).fetchall()
+
+        hcpcs_map: dict[str, list[str]] = {}
+        for npi, codes in hcpcs_rows:
+            hcpcs_map[str(npi)] = [str(c) for c in codes] if isinstance(codes, list) else []
+
+        # Get month-level detail for flagged NPIs (home health codes, high-volume months)
+        month_rows = con.execute("""
+            WITH home_health AS (
+                SELECT
+                    BILLING_PROVIDER_NPI_NUM AS npi,
+                    CLAIM_FROM_MONTH AS month,
+                    SUM(TOTAL_CLAIMS) AS claims_count,
+                    SUM(TOTAL_UNIQUE_BENEFICIARIES) AS unique_beneficiaries,
+                    SUM(TOTAL_PAID) AS monthly_paid
+                FROM spending
+                WHERE BILLING_PROVIDER_NPI_NUM IN (SELECT UNNEST(?::VARCHAR[]))
+                  AND (
+                    HCPCS_CODE BETWEEN 'G0151' AND 'G0162'
+                    OR HCPCS_CODE BETWEEN 'G0299' AND 'G0300'
+                    OR HCPCS_CODE BETWEEN 'S9122' AND 'S9124'
+                    OR HCPCS_CODE BETWEEN 'T1019' AND 'T1022'
+                  )
+                GROUP BY 1, 2
+            )
+            SELECT
+                npi,
+                month,
+                claims_count,
+                unique_beneficiaries,
+                monthly_paid,
+                unique_beneficiaries * 1.0 / NULLIF(claims_count, 0) AS ratio
+            FROM home_health
+            WHERE claims_count > 100
+            ORDER BY npi, month
+        """, [flagged_npis]).fetchall()
+
+        month_detail_map: dict[str, list[dict]] = {}
+        for npi, month, claims, benes, paid, ratio in month_rows:
+            npi_str = str(npi)
+            if npi_str not in month_detail_map:
+                month_detail_map[npi_str] = []
+            month_detail_map[npi_str].append({
+                "month": str(month),
+                "claims_count": int(claims or 0),
+                "unique_beneficiaries": int(benes or 0),
+                "monthly_paid": float(paid or 0),
+                "ratio": float(ratio or 0),
+            })
+
+        for d in results:
+            npi_str = str(d["npi"])
+            d["hcpcs_codes"] = hcpcs_map.get(npi_str, [])
+            d["month_detail"] = month_detail_map.get(npi_str, [])
 
     print(f"    Signal 6: {len(results)} flags")
     return results
@@ -503,11 +660,11 @@ def signal_6_geographic_implausibility(con: duckdb.DuckDBPyConnection) -> list[d
 def run_all_signals(con: duckdb.DuckDBPyConnection) -> dict[str, list[dict]]:
     """Run all 6 fraud signals and return results keyed by signal name."""
     return {
-        "excluded_provider_billing": signal_1_excluded_provider(con),
-        "billing_volume_outlier": signal_2_billing_volume_outlier(con),
-        "rapid_billing_escalation": signal_3_rapid_escalation(con),
+        "excluded_provider": signal_1_excluded_provider(con),
+        "billing_outlier": signal_2_billing_volume_outlier(con),
+        "rapid_escalation": signal_3_rapid_escalation(con),
         "workforce_impossibility": signal_4_workforce_impossibility(con),
-        "shared_authorized_official": signal_5_shared_authorized_official(con),
+        "shared_official": signal_5_shared_authorized_official(con),
         "geographic_implausibility": signal_6_geographic_implausibility(con),
     }
 

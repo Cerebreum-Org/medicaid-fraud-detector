@@ -13,50 +13,41 @@ import duckdb
 
 from src.ingest import DATA_DIR, get_connection, register_views
 
-# Statute references by signal type
-STATUTE_REFS = {
-    "excluded_provider_billing": [
-        "42 U.S.C. § 1320a-7 (Exclusion of certain individuals and entities)",
-        "42 CFR § 1001 (OIG Exclusion Authorities)",
-    ],
-    "billing_volume_outlier": [
-        "31 U.S.C. § 3729 (False Claims Act)",
-        "42 U.S.C. § 1320a-7b(a) (Criminal penalties for acts involving Federal health care programs)",
-    ],
-    "rapid_billing_escalation": [
-        "31 U.S.C. § 3729 (False Claims Act)",
-        "18 U.S.C. § 1347 (Health care fraud)",
-    ],
-    "workforce_impossibility": [
-        "31 U.S.C. § 3729 (False Claims Act)",
-        "42 U.S.C. § 1320a-7b(a)(1) (Filing false claims)",
-    ],
-    "shared_authorized_official": [
-        "18 U.S.C. § 371 (Conspiracy to defraud the United States)",
-        "18 U.S.C. § 1349 (Conspiracy to commit health care fraud)",
-        "42 U.S.C. § 1320a-7b(b) (Anti-kickback statute)",
-    ],
-    "geographic_implausibility": [
-        "31 U.S.C. § 3729 (False Claims Act)",
-        "42 U.S.C. § 1320a-7b(a)(1) (Filing false claims)",
-    ],
+# FCA claim type descriptions by signal type
+FCA_CLAIM_TYPES = {
+    "excluded_provider": "Presenting false claims — excluded provider cannot legally bill federal healthcare programs",
+    "billing_outlier": "Potential overbilling — provider billing far exceeds peer group norms suggesting inflated or fabricated claims",
+    "rapid_escalation": "Potential bust-out scheme — new entity with explosive billing growth consistent with fraud-and-flee pattern",
+    "workforce_impossibility": "False records — billing volume physically impossible for reported workforce, implying fabricated claims",
+    "shared_official": "Conspiracy — coordinated billing through multiple entities controlled by same individual suggests shell company network",
+    "geographic_implausibility": "Reverse false claims — repeated billing on same patients with implausible geographic patterns",
+}
+
+# Single FCA statute reference by signal type
+FCA_STATUTE_REFS = {
+    "excluded_provider": "31 U.S.C. § 3729(a)(1)(A)",
+    "billing_outlier": "31 U.S.C. § 3729(a)(1)(A)",
+    "rapid_escalation": "31 U.S.C. § 3729(a)(1)(A)",
+    "workforce_impossibility": "31 U.S.C. § 3729(a)(1)(B)",
+    "shared_official": "31 U.S.C. § 3729(a)(1)(C)",
+    "geographic_implausibility": "31 U.S.C. § 3729(a)(1)(G)",
 }
 
 # Suggested next steps by signal type
 NEXT_STEPS = {
-    "excluded_provider_billing": [
+    "excluded_provider": [
         "Verify exclusion status on OIG LEIE website and confirm NPI match",
         "Request payment records from state Medicaid agency for the post-exclusion period",
         "Initiate recovery action for all payments made after exclusion date",
         "Refer to OIG for potential criminal prosecution under 42 U.S.C. § 1320a-7b",
     ],
-    "billing_volume_outlier": [
+    "billing_outlier": [
         "Request detailed claims data and supporting documentation from provider",
         "Compare service patterns against peer group norms for the same taxonomy and state",
         "Conduct desk audit of highest-volume service codes",
         "Consider on-site audit if billing exceeds 5x peer median",
     ],
-    "rapid_billing_escalation": [
+    "rapid_escalation": [
         "Review provider enrollment application and supporting documentation",
         "Analyze service code distribution for patterns consistent with upcoding",
         "Interview beneficiaries to verify services were rendered",
@@ -68,7 +59,7 @@ NEXT_STEPS = {
         "Analyze time-of-day claim patterns for statistical impossibilities",
         "Conduct unannounced site visit to verify staffing levels",
     ],
-    "shared_authorized_official": [
+    "shared_official": [
         "Map all NPIs controlled by the authorized official and their corporate relationships",
         "Analyze billing patterns across all controlled entities for coordination",
         "Review state corporate filings for common ownership structures",
@@ -82,24 +73,27 @@ NEXT_STEPS = {
     ],
 }
 
+# Severity ordering for comparisons (higher = more severe)
+SEVERITY_ORDER = {"critical": 3, "high": 2, "medium": 1, "low": 0}
+
 
 def compute_severity(signal_name: str, flag: dict) -> str:
     """Determine severity level based on signal type and evidence strength."""
-    if signal_name == "excluded_provider_billing":
+    if signal_name == "excluded_provider":
         return "critical"
 
-    if signal_name == "billing_volume_outlier":
+    if signal_name == "billing_outlier":
         ratio = flag.get("ratio_to_median", 0)
         return "high" if ratio > 5 else "medium"
 
-    if signal_name == "rapid_billing_escalation":
+    if signal_name == "rapid_escalation":
         growth = flag.get("max_growth_pct", 0)
         return "high" if growth > 500 else "medium"
 
     if signal_name == "workforce_impossibility":
         return "high"
 
-    if signal_name == "shared_authorized_official":
+    if signal_name == "shared_official":
         combined = flag.get("combined_total_paid", 0)
         return "high" if combined > 5_000_000 else "medium"
 
@@ -114,35 +108,73 @@ def estimate_overpayment(signal_name: str, flag: dict) -> float:
     """
     Estimate overpayment in USD based on signal type and evidence.
 
-    Conservative estimates — these are signals, not determinations.
+    Conservative estimates -- these are signals, not determinations.
     """
-    if signal_name == "excluded_provider_billing":
+    if signal_name == "excluded_provider":
         # 100% of payments after exclusion are potentially recoverable
         return float(flag.get("total_paid_after_exclusion", 0))
 
-    if signal_name == "billing_volume_outlier":
-        # Excess above peer median as estimated overpayment
-        total = flag.get("total_paid", 0)
-        median = flag.get("median_paid", 0)
-        return max(0.0, float(total) - float(median))
+    if signal_name == "billing_outlier":
+        # Excess above p99 as estimated overpayment
+        total = float(flag.get("total_paid", 0))
+        p99 = float(flag.get("p99_paid", 0))
+        return max(0.0, total - p99)
 
-    if signal_name == "rapid_billing_escalation":
-        # 50% of total paid in first 12 months as conservative estimate
+    if signal_name == "rapid_escalation":
+        # Total paid in months where growth exceeded 200%
+        # Prefer the exact field if available, otherwise fallback
+        excess = flag.get("total_paid_excess_growth_months")
+        if excess is not None:
+            return float(excess)
         return float(flag.get("total_paid_12mo", 0)) * 0.5
 
     if signal_name == "workforce_impossibility":
-        # Cannot estimate without total paid — use 0 as placeholder
+        # max(0, (peak_claims - 6*8*22) * (peak_total_paid / peak_claims))
+        # 6*8*22 = 1056 = max plausible claims for a single provider in a month
+        claims = float(flag.get("max_monthly_claims", 0))
+        peak_paid = float(flag.get("peak_month_total_paid", 0) or flag.get("total_paid_peak_month", 0))
+        if claims > 0 and peak_paid > 0:
+            return max(0.0, (claims - 1056) * (peak_paid / claims))
         return 0.0
 
-    if signal_name == "shared_authorized_official":
-        # 10% of combined spending as conservative estimate
-        return float(flag.get("combined_total_paid", 0)) * 0.1
+    if signal_name == "shared_official":
+        return 0.0
 
     if signal_name == "geographic_implausibility":
-        # 75% of payments for home health services with implausible patterns
-        return float(flag.get("total_paid", 0)) * 0.75
+        return 0.0
 
     return 0.0
+
+
+def _convert_enumeration_date(raw: str | None) -> str | None:
+    """Convert enumeration_date from MM/DD/YYYY to YYYY-MM-DD. Returns None on failure."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.strptime(raw, "%m/%d/%Y")
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _make_provider_name(info: dict) -> str:
+    """Build provider_name: org_name if available, else 'FIRST LAST'."""
+    org = info.get("org_name")
+    if org:
+        return org
+    first = info.get("first_name", "")
+    last = info.get("last_name", "")
+    name = f"{first} {last}".strip()
+    return name if name else "UNKNOWN"
+
+
+def _convert_entity_type(raw: str | None) -> str:
+    """Convert entity_type code: '1' -> 'individual', '2' -> 'organization'."""
+    if raw == "1":
+        return "individual"
+    if raw == "2":
+        return "organization"
+    return raw or "unknown"
 
 
 def batch_enrich_providers(con: duckdb.DuckDBPyConnection, npis: set[str]) -> dict[str, dict]:
@@ -196,7 +228,7 @@ def batch_aggregate_stats(con: duckdb.DuckDBPyConnection, npis: set[str]) -> dic
             s.BILLING_PROVIDER_NPI_NUM AS npi,
             SUM(s.TOTAL_PAID) AS total_paid_all_time,
             SUM(s.TOTAL_CLAIMS) AS total_claims_all_time,
-            SUM(s.TOTAL_UNIQUE_BENEFICIARIES) AS total_beneficiaries_all_time,
+            SUM(s.TOTAL_UNIQUE_BENEFICIARIES) AS total_unique_beneficiaries_all_time,
             MIN(s.CLAIM_FROM_MONTH) AS first_claim,
             MAX(s.CLAIM_FROM_MONTH) AS last_claim
         FROM spending s
@@ -210,13 +242,21 @@ def batch_aggregate_stats(con: duckdb.DuckDBPyConnection, npis: set[str]) -> dic
         result[npi] = {
             "total_paid_all_time": float(row[1] or 0),
             "total_claims_all_time": int(row[2] or 0),
-            "total_beneficiaries_all_time": int(row[3] or 0),
+            "total_unique_beneficiaries_all_time": int(row[3] or 0),
             "first_claim": str(row[4]) if row[4] else None,
             "last_claim": str(row[5]) if row[5] else None,
         }
 
     print(f"  Computed stats for {len(rows)} providers")
     return result
+
+
+def _get_total_providers_scanned(con: duckdb.DuckDBPyConnection) -> int:
+    """Count total distinct billing providers in spending data."""
+    result = con.execute(
+        "SELECT COUNT(DISTINCT BILLING_PROVIDER_NPI_NUM) FROM spending"
+    ).fetchone()
+    return int(result[0]) if result else 0
 
 
 def build_report(con: duckdb.DuckDBPyConnection, signal_results: dict) -> dict:
@@ -231,7 +271,7 @@ def build_report(con: duckdb.DuckDBPyConnection, signal_results: dict) -> dict:
 
     for signal_name, flags in signal_results.items():
         for flag in flags:
-            # Extract NPI — different signals store it differently
+            # Extract NPI -- different signals store it differently
             npi = flag.get("npi")
             if npi is None:
                 # Signal 5 has npi_list instead of single npi
@@ -246,13 +286,14 @@ def build_report(con: duckdb.DuckDBPyConnection, signal_results: dict) -> dict:
             if npi not in provider_flags:
                 provider_flags[npi] = []
 
+            severity = compute_severity(signal_name, flag)
+            overpayment = estimate_overpayment(signal_name, flag)
+
             provider_flags[npi].append({
-                "signal": signal_name,
-                "severity": compute_severity(signal_name, flag),
+                "signal_type": signal_name,
+                "severity": severity,
                 "evidence": flag,
-                "estimated_overpayment_usd": estimate_overpayment(signal_name, flag),
-                "statute_references": STATUTE_REFS.get(signal_name, []),
-                "suggested_next_steps": NEXT_STEPS.get(signal_name, []),
+                "overpayment": overpayment,
             })
 
     # Build final provider records
@@ -260,66 +301,102 @@ def build_report(con: duckdb.DuckDBPyConnection, signal_results: dict) -> dict:
     enrichment_cache = batch_enrich_providers(con, all_npis)
     stats_cache = batch_aggregate_stats(con, all_npis)
 
-    providers = []
-    for npi, flags in provider_flags.items():
+    # Get total providers scanned
+    total_providers_scanned = _get_total_providers_scanned(con)
+
+    flagged_providers = []
+    for npi, flags_list in provider_flags.items():
         provider_info = enrichment_cache.get(npi, {"npi": npi})
         agg_stats = stats_cache.get(npi, {})
 
-        # Overall severity is the worst among all flags
-        severity_order = {"critical": 3, "high": 2, "medium": 1, "low": 0}
-        overall_severity = max(
-            (f["severity"] for f in flags),
-            key=lambda s: severity_order.get(s, 0),
+        # Find the most severe signal
+        most_severe_signal = max(
+            flags_list,
+            key=lambda f: SEVERITY_ORDER.get(f["severity"], 0),
         )
+        most_severe_type = most_severe_signal["signal_type"]
 
-        total_estimated_overpayment = sum(f["estimated_overpayment_usd"] for f in flags)
+        # Compute total estimated overpayment across all signals for this provider
+        total_overpayment = sum(f["overpayment"] for f in flags_list)
 
-        providers.append({
+        # Aggregate suggested_next_steps from all signals
+        all_next_steps = []
+        seen_steps = set()
+        for f in flags_list:
+            for step in NEXT_STEPS.get(f["signal_type"], []):
+                if step not in seen_steps:
+                    seen_steps.add(step)
+                    all_next_steps.append(step)
+
+        # Build fca_relevance from the most severe signal
+        fca_relevance = {
+            "claim_type": FCA_CLAIM_TYPES.get(most_severe_type, ""),
+            "statute_reference": FCA_STATUTE_REFS.get(most_severe_type, ""),
+            "suggested_next_steps": all_next_steps,
+        }
+
+        # Build the per-signal list (only signal_type, severity, evidence)
+        signals = []
+        for f in flags_list:
+            signals.append({
+                "signal_type": f["signal_type"],
+                "severity": f["severity"],
+                "evidence": f["evidence"],
+            })
+
+        # Build flattened provider record
+        provider_record = {
             "npi": npi,
-            "provider_info": provider_info,
-            "aggregate_stats": agg_stats,
-            "overall_severity": overall_severity,
-            "total_estimated_overpayment_usd": round(total_estimated_overpayment, 2),
-            "signal_count": len(flags),
-            "flags": flags,
-        })
+            "provider_name": _make_provider_name(provider_info),
+            "entity_type": _convert_entity_type(provider_info.get("entity_type")),
+            "taxonomy_code": provider_info.get("taxonomy") or "",
+            "state": provider_info.get("state") or "",
+            "enumeration_date": _convert_enumeration_date(provider_info.get("enumeration_date")),
+            "total_paid_all_time": agg_stats.get("total_paid_all_time", 0.00),
+            "total_claims_all_time": agg_stats.get("total_claims_all_time", 0),
+            "total_unique_beneficiaries_all_time": agg_stats.get("total_unique_beneficiaries_all_time", 0),
+            "signals": signals,
+            "estimated_overpayment_usd": round(total_overpayment, 2),
+            "fca_relevance": fca_relevance,
+        }
 
-    # Sort by severity then estimated overpayment
+        flagged_providers.append(provider_record)
+
+    # Sort by severity (most severe first) then by estimated overpayment descending
     severity_sort = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    providers.sort(
+    flagged_providers.sort(
         key=lambda p: (
-            severity_sort.get(p["overall_severity"], 99),
-            -p["total_estimated_overpayment_usd"],
+            severity_sort.get(
+                max(
+                    (s["severity"] for s in p["signals"]),
+                    key=lambda sv: SEVERITY_ORDER.get(sv, 0),
+                ),
+                99,
+            ),
+            -p["estimated_overpayment_usd"],
         )
     )
 
-    # Compute summary stats
-    signal_counts = {}
+    # Compute signal_counts
+    signal_counts = {
+        "excluded_provider": 0,
+        "billing_outlier": 0,
+        "rapid_escalation": 0,
+        "workforce_impossibility": 0,
+        "shared_official": 0,
+        "geographic_implausibility": 0,
+    }
     for signal_name, flags in signal_results.items():
-        signal_counts[signal_name] = len(flags)
+        if signal_name in signal_counts:
+            signal_counts[signal_name] = len(flags)
 
     report = {
-        "metadata": {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "engine": "medicaid-fraud-detector v1.0",
-            "data_sources": {
-                "medicaid_spending": "HHS Medicaid Provider Spending (2026-02-09)",
-                "leie_exclusions": "OIG LEIE Exclusions (UPDATED.csv)",
-                "nppes_registry": "CMS NPPES NPI Registry (February 2026 V2)",
-            },
-            "total_providers_flagged": len(providers),
-            "total_flags": sum(len(p["flags"]) for p in providers),
-            "total_estimated_overpayment_usd": round(
-                sum(p["total_estimated_overpayment_usd"] for p in providers), 2
-            ),
-            "severity_distribution": {
-                "critical": sum(1 for p in providers if p["overall_severity"] == "critical"),
-                "high": sum(1 for p in providers if p["overall_severity"] == "high"),
-                "medium": sum(1 for p in providers if p["overall_severity"] == "medium"),
-            },
-            "signal_counts": signal_counts,
-        },
-        "providers": providers,
+        "generated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        "tool_version": "medicaid-fraud-detector v1.0",
+        "total_providers_scanned": total_providers_scanned,
+        "total_providers_flagged": len(flagged_providers),
+        "signal_counts": signal_counts,
+        "flagged_providers": flagged_providers,
     }
 
     return report
@@ -348,10 +425,11 @@ def main() -> None:
         json.dump(report, f, indent=2, default=str)
 
     print(f"  Report written: {output_path}")
-    print(f"  Providers flagged: {report['metadata']['total_providers_flagged']}")
-    print(f"  Total flags: {report['metadata']['total_flags']}")
-    print(f"  Estimated overpayment: ${report['metadata']['total_estimated_overpayment_usd']:,.2f}")
-    print(f"  Severity: {report['metadata']['severity_distribution']}")
+    print(f"  Providers flagged: {report['total_providers_flagged']}")
+    print(f"  Total providers scanned: {report['total_providers_scanned']}")
+    sig_total = sum(report['signal_counts'].values())
+    print(f"  Total signals: {sig_total}")
+    print(f"  Signal counts: {report['signal_counts']}")
 
     con.close()
     print("=== Report generation complete ===")

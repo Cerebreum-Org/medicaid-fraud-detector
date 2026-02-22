@@ -96,14 +96,14 @@ class TestSignal1ExcludedProvider:
         assert "1000000001" not in flagged_npis
 
 
-class TestSignal2BillingVolumeOutlier:
-    """Signal 2: Billing Volume Outlier (p99 by taxonomy+state)."""
+class TestSignal2BillingOutlier:
+    """Signal 2: Billing Outlier (p99 by taxonomy+state)."""
 
     def test_outlier_flagged(self, con):
         """Provider 1000000050 bills 100x peers — should be above p99."""
-        from src.signals import signal_2_billing_volume_outlier
+        from src.signals import signal_2_billing_volume_outlier as signal_2_billing_outlier
 
-        results = signal_2_billing_volume_outlier(con)
+        results = signal_2_billing_outlier(con)
         flagged_npis = {r["npi"] for r in results}
         assert "1000000050" in flagged_npis, (
             "Expected volume outlier 1000000050 to be flagged"
@@ -111,9 +111,9 @@ class TestSignal2BillingVolumeOutlier:
 
     def test_outlier_has_high_ratio(self, con):
         """The outlier's ratio_to_median should be very high."""
-        from src.signals import signal_2_billing_volume_outlier
+        from src.signals import signal_2_billing_volume_outlier as signal_2_billing_outlier
 
-        results = signal_2_billing_volume_outlier(con)
+        results = signal_2_billing_outlier(con)
         for r in results:
             if r["npi"] == "1000000050":
                 assert r["ratio_to_median"] > 5, (
@@ -122,9 +122,9 @@ class TestSignal2BillingVolumeOutlier:
 
     def test_normal_providers_not_flagged(self, con):
         """Normal CA providers should not be flagged."""
-        from src.signals import signal_2_billing_volume_outlier
+        from src.signals import signal_2_billing_volume_outlier as signal_2_billing_outlier
 
-        results = signal_2_billing_volume_outlier(con)
+        results = signal_2_billing_outlier(con)
         flagged_npis = {r["npi"] for r in results}
         assert "1000000001" not in flagged_npis
 
@@ -179,14 +179,14 @@ class TestSignal4WorkforceImpossibility:
                 )
 
 
-class TestSignal5SharedAuthorizedOfficial:
-    """Signal 5: Shared Authorized Official."""
+class TestSignal5SharedOfficial:
+    """Signal 5: Shared Official."""
 
     def test_shared_official_flagged(self, con):
         """KINGPIN CARL controls 6 NPIs with >$1M combined → flagged."""
-        from src.signals import signal_5_shared_authorized_official
+        from src.signals import signal_5_shared_authorized_official as signal_5_shared_official
 
-        results = signal_5_shared_authorized_official(con)
+        results = signal_5_shared_official(con)
         assert len(results) > 0, "Expected at least one shared official flag"
         # Find the KINGPIN entry
         kingpin = [r for r in results if r["off_last"] == "KINGPIN"]
@@ -196,9 +196,9 @@ class TestSignal5SharedAuthorizedOfficial:
 
     def test_non_shared_official_not_flagged(self, con):
         """Officials controlling < 5 NPIs should not be flagged."""
-        from src.signals import signal_5_shared_authorized_official
+        from src.signals import signal_5_shared_authorized_official as signal_5_shared_official
 
-        results = signal_5_shared_authorized_official(con)
+        results = signal_5_shared_official(con)
         for r in results:
             assert r["npi_count"] >= 5
 
@@ -232,17 +232,56 @@ class TestOutputReport:
     """Test the report generation logic."""
 
     def test_build_report_structure(self, con):
-        """Report should have metadata and providers keys with correct structure."""
+        """Report should have top-level keys with correct structure."""
         from src.signals import run_all_signals
         from src.output import build_report
 
         signal_results = run_all_signals(con)
         report = build_report(con, signal_results)
 
-        assert "metadata" in report
-        assert "providers" in report
-        assert report["metadata"]["total_providers_flagged"] > 0
-        assert report["metadata"]["total_flags"] > 0
+        # Top-level keys
+        assert "total_providers_flagged" in report
+        assert "total_providers_scanned" in report
+        assert "tool_version" in report
+        assert "generated_at" in report
+        assert "flagged_providers" in report
+        assert report["total_providers_flagged"] > 0
+
+    def test_provider_schema(self, con):
+        """Each flagged provider should have the updated field schema."""
+        from src.signals import run_all_signals
+        from src.output import build_report
+
+        signal_results = run_all_signals(con)
+        report = build_report(con, signal_results)
+
+        for provider in report["flagged_providers"]:
+            assert "npi" in provider
+            assert "provider_name" in provider
+            assert isinstance(provider["provider_name"], str)
+
+            # entity_type should be "individual", "organization", or "unknown"
+            assert provider["entity_type"] in ("individual", "organization", "unknown"), (
+                f"Expected entity_type 'individual' or 'organization', got '{provider['entity_type']}'"
+            )
+
+            assert "taxonomy_code" in provider
+            assert "enumeration_date" in provider
+            # enumeration_date should be YYYY-MM-DD format or None
+            if provider["enumeration_date"] is not None:
+                assert len(provider["enumeration_date"]) == 10, (
+                    f"Expected YYYY-MM-DD format, got '{provider['enumeration_date']}'"
+                )
+
+            assert "signals" in provider
+            assert "estimated_overpayment_usd" in provider
+
+            # Provider should have fca_relevance
+            assert "fca_relevance" in provider
+            fca = provider["fca_relevance"]
+            assert "claim_type" in fca
+            assert "statute_reference" in fca
+            assert "suggested_next_steps" in fca
 
     def test_severity_assignment(self, con):
         """Excluded providers should have critical severity."""
@@ -253,9 +292,10 @@ class TestOutputReport:
         report = build_report(con, signal_results)
 
         # Find provider 1000000099 (excluded)
-        excluded = [p for p in report["providers"] if p["npi"] == "1000000099"]
+        excluded = [p for p in report["flagged_providers"] if p["npi"] == "1000000099"]
         assert len(excluded) == 1
-        assert excluded[0]["overall_severity"] == "critical"
+        severities = [s["severity"] for s in excluded[0]["signals"]]
+        assert "critical" in severities
 
     def test_all_signals_produce_results(self, con):
         """Each of the 6 signals should produce at least 1 flag."""
@@ -264,3 +304,32 @@ class TestOutputReport:
         signal_results = run_all_signals(con)
         for signal_name, flags in signal_results.items():
             assert len(flags) > 0, f"Signal {signal_name} produced no flags"
+
+    def test_signal2_overpayment_uses_p99(self, con):
+        """Signal 2 overpayment should be (total - p99), not (total - median)."""
+        from src.signals import run_all_signals
+        from src.output import build_report
+
+        signal_results = run_all_signals(con)
+        report = build_report(con, signal_results)
+
+        outlier = [p for p in report["flagged_providers"] if p["npi"] == "1000000050"]
+        assert len(outlier) == 1
+        # Overpayment should be positive (total_paid - p99_paid)
+        assert outlier[0]["estimated_overpayment_usd"] > 0
+
+    def test_signal5_overpayment_is_zero(self, con):
+        """Signal 5 (shared official) overpayment should be 0."""
+        from src.output import estimate_overpayment
+
+        # Signal 5 overpayment should always be 0
+        flag = {"combined_total_paid": 5_000_000, "npi_list": ["1", "2"]}
+        assert estimate_overpayment("shared_official", flag) == 0.0
+
+    def test_signal6_overpayment_is_zero(self, con):
+        """Signal 6 (geographic implausibility) overpayment should be 0."""
+        from src.output import estimate_overpayment
+
+        # Signal 6 overpayment should always be 0
+        flag = {"total_paid": 300_000, "bene_to_claims_ratio": 0.05}
+        assert estimate_overpayment("geographic_implausibility", flag) == 0.0
