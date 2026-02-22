@@ -129,15 +129,8 @@ def estimate_overpayment(signal_name: str, flag: dict) -> float:
         return float(flag.get("total_paid_12mo", 0)) * 0.5
 
     if signal_name == "workforce_impossibility":
-        # Sum across all impossible months: for each month, excess = (claims - 1056) * avg_cost
-        # Simplified: total_paid_impossible * (1 - 1056 * impossible_months / total_claims_impossible)
-        total_paid = float(flag.get("total_paid_impossible", 0))
-        total_claims = float(flag.get("total_claims_impossible", 0))
-        months = int(flag.get("impossible_months_count", 0))
-        plausible_claims = 1056.0 * months  # max plausible = 6 claims/hr * 8hr * 22 days * months
-        if total_claims > 0 and total_paid > 0:
-            return max(0.0, total_paid * (1 - plausible_claims / total_claims))
-        return 0.0
+        # Pre-computed per-month in SQL: SUM((claims - 1056) * avg_cost_per_claim)
+        return max(0.0, float(flag.get("estimated_overpayment", 0)))
 
     if signal_name == "shared_official":
         return 0.0

@@ -6,7 +6,7 @@ DATA_DIR="$SCRIPT_DIR/data"
 mkdir -p "$DATA_DIR"
 
 echo "=== Installing Python dependencies ==="
-pip install -r "$SCRIPT_DIR/requirements.txt"
+python3 -m pip install -r "$SCRIPT_DIR/requirements.txt"
 
 MEDICAID_URL="https://stopendataprod.blob.core.windows.net/datasets/medicaid-provider-spending/2026-02-09/medicaid-provider-spending.parquet"
 LEIE_URL="https://oig.hhs.gov/exclusions/downloadables/UPDATED.csv"

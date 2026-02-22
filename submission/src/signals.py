@@ -66,10 +66,29 @@ def signal_1_excluded_provider(con: duckdb.DuckDBPyConnection) -> list[dict]:
             WHERE m.CLAIM_FROM_MONTH >= l.excl_ym
               AND (l.rein_ym IS NULL OR m.CLAIM_FROM_MONTH < l.rein_ym)
             GROUP BY 1, 2, 3
+        ),
+        combined AS (
+            SELECT * FROM billing_matches
+            UNION ALL
+            SELECT * FROM servicing_matches
+        ),
+        -- Deduplicate: if a provider appears as both billing and servicing,
+        -- aggregate into a single row to avoid double-counting overpayment
+        deduplicated AS (
+            SELECT
+                npi,
+                ANY_VALUE(EXCLDATE) AS EXCLDATE,
+                ANY_VALUE(EXCLTYPE) AS EXCLTYPE,
+                CASE WHEN COUNT(DISTINCT match_role) > 1 THEN 'billing+servicing'
+                     ELSE ANY_VALUE(match_role) END AS match_role,
+                SUM(total_paid_after_exclusion) AS total_paid_after_exclusion,
+                SUM(total_claims_after_exclusion) AS total_claims_after_exclusion,
+                MIN(first_claim_month) AS first_claim_month,
+                MAX(last_claim_month) AS last_claim_month
+            FROM combined
+            GROUP BY npi
         )
-        SELECT * FROM billing_matches
-        UNION ALL
-        SELECT * FROM servicing_matches
+        SELECT * FROM deduplicated
     """).fetchall()
 
     columns = [
@@ -101,12 +120,12 @@ def signal_1_excluded_provider(con: duckdb.DuckDBPyConnection) -> list[dict]:
             FROM leie
             WHERE NPI IS NULL OR CAST(NPI AS VARCHAR) = ''
         ),
-        name_matches AS (
+        billing_name_matches AS (
             SELECT
                 n.npi,
                 l.EXCLDATE,
                 l.EXCLTYPE,
-                'name_match' AS match_role,
+                'name_match_billing' AS match_role,
                 SUM(m.TOTAL_PAID) AS total_paid_after_exclusion,
                 SUM(m.TOTAL_CLAIMS) AS total_claims_after_exclusion,
                 MIN(m.CLAIM_FROM_MONTH) AS first_claim_month,
@@ -119,8 +138,45 @@ def signal_1_excluded_provider(con: duckdb.DuckDBPyConnection) -> list[dict]:
             WHERE m.CLAIM_FROM_MONTH >= l.excl_ym
               AND (l.rein_ym IS NULL OR m.CLAIM_FROM_MONTH < l.rein_ym)
             GROUP BY 1, 2, 3
+        ),
+        servicing_name_matches AS (
+            SELECT
+                n.npi,
+                l.EXCLDATE,
+                l.EXCLTYPE,
+                'name_match_servicing' AS match_role,
+                SUM(m.TOTAL_PAID) AS total_paid_after_exclusion,
+                SUM(m.TOTAL_CLAIMS) AS total_claims_after_exclusion,
+                MIN(m.CLAIM_FROM_MONTH) AS first_claim_month,
+                MAX(m.CLAIM_FROM_MONTH) AS last_claim_month
+            FROM leie_no_npi l
+            JOIN nppes n ON UPPER(TRIM(n.last_name)) = UPPER(TRIM(l.LASTNAME))
+                        AND UPPER(TRIM(n.first_name)) = UPPER(TRIM(l.FIRSTNAME))
+                        AND UPPER(TRIM(n.state)) = UPPER(TRIM(l.STATE))
+            JOIN spending m ON m.SERVICING_PROVIDER_NPI_NUM = n.npi
+            WHERE m.CLAIM_FROM_MONTH >= l.excl_ym
+              AND (l.rein_ym IS NULL OR m.CLAIM_FROM_MONTH < l.rein_ym)
+            GROUP BY 1, 2, 3
+        ),
+        combined_name AS (
+            SELECT * FROM billing_name_matches
+            UNION ALL
+            SELECT * FROM servicing_name_matches
+        ),
+        deduplicated_name AS (
+            SELECT
+                npi,
+                ANY_VALUE(EXCLDATE) AS EXCLDATE,
+                ANY_VALUE(EXCLTYPE) AS EXCLTYPE,
+                'name_match' AS match_role,
+                SUM(total_paid_after_exclusion) AS total_paid_after_exclusion,
+                SUM(total_claims_after_exclusion) AS total_claims_after_exclusion,
+                MIN(first_claim_month) AS first_claim_month,
+                MAX(last_claim_month) AS last_claim_month
+            FROM combined_name
+            GROUP BY npi
         )
-        SELECT * FROM name_matches
+        SELECT * FROM deduplicated_name
     """).fetchall()
 
     for row in rows2:
@@ -396,6 +452,8 @@ def signal_4_workforce_impossibility(con: duckdb.DuckDBPyConnection) -> list[dic
                 COUNT(*) AS impossible_months_count,
                 SUM(monthly_claims) AS total_claims_impossible,
                 SUM(monthly_paid) AS total_paid_impossible,
+                -- Per-month overpayment: excess claims * avg cost per claim
+                SUM(GREATEST(0, (monthly_claims - 1056.0) * (monthly_paid / monthly_claims))) AS estimated_overpayment,
                 (SELECT month FROM impossible_months i2
                  WHERE i2.npi = impossible_months.npi
                  ORDER BY monthly_claims DESC LIMIT 1) AS peak_month,
@@ -413,14 +471,16 @@ def signal_4_workforce_impossibility(con: duckdb.DuckDBPyConnection) -> list[dic
             total_paid_peak_month,
             impossible_months_count,
             total_claims_impossible,
-            total_paid_impossible
+            total_paid_impossible,
+            estimated_overpayment
         FROM aggregated
         ORDER BY implied_claims_per_hour DESC
     """).fetchall()
 
     columns = ["npi", "max_monthly_claims", "peak_month", "implied_claims_per_hour",
                 "total_paid_peak_month", "impossible_months_count",
-                "total_claims_impossible", "total_paid_impossible"]
+                "total_claims_impossible", "total_paid_impossible",
+                "estimated_overpayment"]
 
     results = []
     for row in rows:
@@ -433,6 +493,7 @@ def signal_4_workforce_impossibility(con: duckdb.DuckDBPyConnection) -> list[dic
         d["impossible_months_count"] = int(d["impossible_months_count"] or 0)
         d["total_claims_impossible"] = int(d["total_claims_impossible"] or 0)
         d["total_paid_impossible"] = float(d["total_paid_impossible"] or 0)
+        d["estimated_overpayment"] = float(d["estimated_overpayment"] or 0)
         results.append(d)
 
     print(f"    Signal 4: {len(results)} flags")
